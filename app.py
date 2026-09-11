@@ -1,1078 +1,712 @@
 """
 Smart Multi-Document Compliance & Contract Auditor
+====================================================
 
-Architecture:
-    PDF Upload
-        ↓
-    PDF Text Extraction
-        ↓
-    Metadata Preservation
-        ↓
-    Recursive Chunking
-        ↓
-    HuggingFace Embeddings
-        ↓
-    FAISS Vector Store
-        ↓
-    Similarity Retrieval
-        ↓
-    Groq LLM Draft Answer
-        ↓
-    Corrective Groundedness Verification
-        ↓
-    Citation-Aware Final Answer
-        ↓
-    Source Evidence UI
+A Streamlit application that lets a user upload one or more PDF contracts /
+policy documents, builds a FAISS vector index over them, and answers
+compliance questions using a Corrective RAG pipeline:
 
-Technology:
-    - Streamlit
-    - LangChain
-    - Groq
-    - HuggingFace Sentence Transformers
-    - FAISS CPU
-    - pypdf
+    Extract -> Chunk -> Embed -> Retrieve -> LLM Answer
+        -> Self-Verification / Groundedness Check -> UI Output
+
+LLM: Groq (llama-3.3-70b-versatile / llama3-8b-8192) via langchain-groq
+Embeddings: sentence-transformers/all-MiniLM-L6-v2 (HuggingFace, local, free)
+Vector store: FAISS (CPU, in-memory, cached in st.session_state)
+
+Author: Generated for the "contract-compliance-auditor" project.
 """
 
-from __future__ import annotations
-
-import io
-import json
 import os
-import re
-from typing import Any
+import io
+import time
+import tempfile
+from datetime import datetime
+from typing import List, Dict, Any
 
 import streamlit as st
 from dotenv import load_dotenv
-from pypdf import PdfReader
 
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from pypdf import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# HuggingFaceEmbeddings moved from langchain_community to langchain_huggingface.
+# We try the new package first and gracefully fall back to keep the app
+# working regardless of which version the user has installed.
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:  # pragma: no cover - fallback for older installs
+    from langchain_community.embeddings import HuggingFaceEmbeddings
 
 
-# ---------------------------------------------------------------------------
-# Application configuration
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 0. ENVIRONMENT & PAGE CONFIGURATION
+# --------------------------------------------------------------------------
 
-load_dotenv()
-
-APP_TITLE = "Smart Multi-Document Compliance & Contract Auditor"
-
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-DEFAULT_CHUNK_SIZE = 1000
-DEFAULT_CHUNK_OVERLAP = 150
-DEFAULT_RETRIEVAL_K = 4
-
-SUPPORTED_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama3-8b-8192",
-]
-
-
-# ---------------------------------------------------------------------------
-# Streamlit page configuration
-# ---------------------------------------------------------------------------
+load_dotenv()  # allows a local .env file to populate os.environ
 
 st.set_page_config(
-    page_title=APP_TITLE,
+    page_title="Smart Multi-Document Compliance & Contract Auditor",
     page_icon="📑",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-# ---------------------------------------------------------------------------
-# Custom CSS
-# ---------------------------------------------------------------------------
-
-st.markdown(
-    """
-    <style>
-        .main {
-            padding-top: 1.5rem;
-        }
-
-        .app-header {
-            padding: 1.5rem 1.75rem;
-            border-radius: 16px;
-            background: linear-gradient(
-                135deg,
-                rgba(31, 41, 55, 0.98),
-                rgba(17, 24, 39, 0.98)
-            );
-            color: white;
-            margin-bottom: 1.5rem;
-            border: 1px solid rgba(255,255,255,0.08);
-        }
-
-        .app-header h1 {
-            margin: 0;
-            font-size: 2.1rem;
-            font-weight: 700;
-        }
-
-        .app-header p {
-            margin-top: 0.6rem;
-            margin-bottom: 0;
-            color: #d1d5db;
-            font-size: 1rem;
-        }
-
-        .metric-card {
-            padding: 1rem;
-            border-radius: 12px;
-            border: 1px solid rgba(128,128,128,0.25);
-            background-color: rgba(128,128,128,0.05);
-            text-align: center;
-        }
-
-        .metric-value {
-            font-size: 1.5rem;
-            font-weight: 700;
-        }
-
-        .metric-label {
-            font-size: 0.82rem;
-            opacity: 0.75;
-        }
-
-        .source-card {
-            padding: 0.9rem;
-            border-radius: 10px;
-            border: 1px solid rgba(128,128,128,0.25);
-            margin-bottom: 0.75rem;
-            background-color: rgba(128,128,128,0.04);
-        }
-
-        .citation {
-            font-weight: 600;
-        }
-
-        .warning-box {
-            padding: 1rem;
-            border-radius: 10px;
-            border: 1px solid rgba(245, 158, 11, 0.45);
-            background-color: rgba(245, 158, 11, 0.08);
-        }
-
-        .success-box {
-            padding: 1rem;
-            border-radius: 10px;
-            border: 1px solid rgba(34, 197, 94, 0.45);
-            background-color: rgba(34, 197, 94, 0.08);
-        }
-
-        footer {
-            visibility: hidden;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-
-st.markdown(
-    f"""
-    <div class="app-header">
-        <h1>📑 {APP_TITLE}</h1>
-        <p>
-            Analyze multiple contracts, policies, compliance documents and
-            agreements using corrective retrieval-augmented generation.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ---------------------------------------------------------------------------
-# Session-state initialization
-# ---------------------------------------------------------------------------
-
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-
-if "processed_documents" not in st.session_state:
-    st.session_state.processed_documents = []
-
-if "document_chunks" not in st.session_state:
-    st.session_state.document_chunks = []
-
-if "document_stats" not in st.session_state:
-    st.session_state.document_stats = {
-        "files": 0,
-        "pages": 0,
-        "chunks": 0,
+CUSTOM_CSS = """
+<style>
+    /* ---- Global font & background tweaks ---- */
+    .main {
+        background-color: #0f172a;
+    }
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
     }
 
-if "last_query" not in st.session_state:
-    st.session_state.last_query = ""
+    /* ---- Title styling ---- */
+    .app-title {
+        font-size: 2.3rem;
+        font-weight: 800;
+        color: #f8fafc;
+        margin-bottom: 0.2rem;
+    }
+    .app-subtitle {
+        font-size: 1.05rem;
+        color: #94a3b8;
+        margin-bottom: 1.5rem;
+    }
 
-if "last_sources" not in st.session_state:
-    st.session_state.last_sources = []
+    /* ---- Cards ---- */
+    .metric-card {
+        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 0.75rem;
+    }
+
+    /* ---- Verdict badges ---- */
+    .badge-grounded {
+        display: inline-block;
+        background-color: #14532d;
+        color: #bbf7d0;
+        border: 1px solid #22c55e;
+        border-radius: 999px;
+        padding: 0.15rem 0.85rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+    }
+    .badge-warning {
+        display: inline-block;
+        background-color: #451a03;
+        color: #fde68a;
+        border: 1px solid #f59e0b;
+        border-radius: 999px;
+        padding: 0.15rem 0.85rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+    }
+    .badge-unverified {
+        display: inline-block;
+        background-color: #450a0a;
+        color: #fecaca;
+        border: 1px solid #ef4444;
+        border-radius: 999px;
+        padding: 0.15rem 0.85rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+    }
+
+    /* ---- Source chunk box ---- */
+    .source-chunk {
+        background-color: #111827;
+        border-left: 3px solid #6366f1;
+        border-radius: 6px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.6rem;
+        font-size: 0.88rem;
+        color: #e2e8f0;
+        white-space: pre-wrap;
+    }
+    .source-meta {
+        font-size: 0.78rem;
+        color: #93c5fd;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+    }
+
+    /* ---- Chat bubbles ---- */
+    .stChatMessage {
+        border-radius: 12px;
+    }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 1. CONSTANTS
+# --------------------------------------------------------------------------
 
-def get_secret_or_env(name: str) -> str:
+AVAILABLE_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama3-8b-8192",
+]
+
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 150
+RETRIEVAL_K = 4
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+SYSTEM_ANSWER_PROMPT = """You are an expert contract and compliance auditor AI.
+You answer strictly using the CONTEXT provided below, which was retrieved from
+the user's uploaded documents. You are meticulous, precise, and conservative:
+you never invent clauses, dates, obligations, or numbers that are not present
+in the context.
+
+Rules:
+1. Answer only using information found in the CONTEXT.
+2. If the CONTEXT does not contain enough information to answer confidently,
+   explicitly say so instead of guessing.
+3. Every factual claim or clause you reference MUST be followed by an inline
+   citation in the exact format: [Source: <filename>, Page <page_number>].
+4. If multiple sources support a claim, cite all of them.
+5. Structure your answer with clear markdown: use headers, bullet points, or
+   numbered lists where it improves clarity (e.g., listing obligations,
+   deadlines, penalties, or compliance gaps).
+6. Keep the tone formal and objective, as befits a compliance report.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+Write your grounded, cited answer below:
+"""
+
+VERIFICATION_PROMPT = """You are a strict fact-checking auditor performing a
+"groundedness verification" pass on a draft answer produced by another AI.
+
+Your job: compare every statement in the DRAFT ANSWER against the SOURCE
+CONTEXT chunks. Flag any statement that is not directly supported by the
+context (a hallucination, an unsupported inference, or a missing citation).
+
+SOURCE CONTEXT:
+{context}
+
+DRAFT ANSWER:
+{draft_answer}
+
+Respond in the following strict markdown format and nothing else:
+
+VERDICT: <one of: FULLY_GROUNDED | PARTIALLY_GROUNDED | UNVERIFIED>
+
+SUMMARY: <one or two sentence summary of your assessment>
+
+ISSUES:
+- <bullet list of any unsupported/ungrounded claims, or "None found." if
+  the draft is fully grounded>
+
+CORRECTED_ANSWER:
+<If VERDICT is FULLY_GROUNDED, simply repeat the draft answer unchanged.
+If PARTIALLY_GROUNDED or UNVERIFIED, rewrite the answer removing or
+qualifying any ungrounded claims, keeping only statements that are directly
+supported by the SOURCE CONTEXT, while preserving correct citations.>
+"""
+
+
+# --------------------------------------------------------------------------
+# 2. SESSION STATE INITIALIZATION
+# --------------------------------------------------------------------------
+
+def init_session_state() -> None:
+    defaults = {
+        "vectorstore": None,
+        "processed_files": [],
+        "chat_history": [],  # list of dicts: {role, content, sources, verdict}
+        "embeddings_model": None,
+        "processing_done": False,
+        "total_chunks": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+init_session_state()
+
+
+# --------------------------------------------------------------------------
+# 3. DOCUMENT PROCESSING PIPELINE
+# --------------------------------------------------------------------------
+
+def extract_documents_from_pdfs(uploaded_files: List[Any]) -> List[Document]:
     """
-    Retrieve a configuration value in the following order:
-
-    1. Streamlit secrets
-    2. Environment variable
-
-    Returns an empty string when the value is unavailable.
+    Reads each uploaded PDF with pypdf, extracts text page-by-page, and
+    returns a list of LangChain Document objects with metadata preserving
+    the source filename and the 1-indexed page number.
     """
+    all_docs: List[Document] = []
 
-    try:
-        value = st.secrets.get(name, "")
-        if value:
-            return str(value).strip()
-    except Exception:
-        pass
+    for uploaded_file in uploaded_files:
+        try:
+            file_bytes = uploaded_file.read()
+            reader = PdfReader(io.BytesIO(file_bytes))
 
-    return os.getenv(name, "").strip()
+            for page_index, page in enumerate(reader.pages):
+                page_text = page.extract_text() or ""
+                page_text = page_text.strip()
+
+                if not page_text:
+                    # Skip empty / scanned-image pages with no extractable text
+                    continue
+
+                doc = Document(
+                    page_content=page_text,
+                    metadata={
+                        "source": uploaded_file.name,
+                        "page": page_index + 1,  # human-readable, 1-indexed
+                    },
+                )
+                all_docs.append(doc)
+
+        except Exception as exc:
+            st.error(f"❌ Failed to read '{uploaded_file.name}': {exc}")
+
+    return all_docs
+
+
+def chunk_documents(documents: List[Document]) -> List[Document]:
+    """
+    Splits page-level documents into overlapping chunks while preserving
+    the original source/page metadata on every resulting chunk.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks = splitter.split_documents(documents)
+    return chunks
 
 
 @st.cache_resource(show_spinner=False)
-def load_embedding_model() -> HuggingFaceEmbeddings:
+def load_embedding_model(model_name: str):
     """
-    Load and cache the HuggingFace embedding model.
-
-    Streamlit cache_resource prevents the embedding model from being
-    downloaded and initialized for every interaction.
+    Loads (and caches across reruns) the HuggingFace sentence-transformers
+    embedding model. Cached with st.cache_resource so the model is only
+    downloaded/initialized once per session/server process.
     """
-
     return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
+        model_name=model_name,
         model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
     )
 
 
-def clean_text(text: str) -> str:
+def build_vector_store(chunks: List[Document], embeddings) -> FAISS:
     """
-    Normalize extracted PDF text without destroying meaningful content.
+    Builds a FAISS vector store in memory from the provided chunks and
+    embedding model.
     """
-
-    if not text:
-        return ""
-
-    text = text.replace("\x00", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
+    vectorstore = FAISS.from_documents(documents=chunks, embedding=embeddings)
+    return vectorstore
 
 
-def extract_pdf_documents(uploaded_files: list[Any]) -> list[Document]:
+def process_uploaded_documents(uploaded_files: List[Any]) -> None:
     """
-    Extract text from every uploaded PDF.
-
-    Each PDF page becomes a LangChain Document so that page-level
-    metadata can be preserved.
-
-    Metadata:
-        source
-        file_name
-        page
-        page_number
+    Full pipeline orchestration: Extract -> Chunk -> Embed -> Index.
+    Populates st.session_state with the resulting FAISS vector store.
     """
+    if not uploaded_files:
+        st.warning("⚠️ Please upload at least one PDF file before processing.")
+        return
 
-    documents: list[Document] = []
+    progress_bar = st.sidebar.progress(0, text="Starting document pipeline...")
 
-    for uploaded_file in uploaded_files:
-        file_bytes = uploaded_file.getvalue()
+    # Step 1: Extract
+    progress_bar.progress(15, text="📄 Extracting text from PDFs...")
+    raw_docs = extract_documents_from_pdfs(uploaded_files)
 
-        try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-        except Exception as exc:
-            raise ValueError(
-                f"Unable to read '{uploaded_file.name}' as a PDF: {exc}"
-            ) from exc
-
-        for page_index, page in enumerate(reader.pages):
-            try:
-                extracted_text = page.extract_text() or ""
-            except Exception:
-                extracted_text = ""
-
-            extracted_text = clean_text(extracted_text)
-
-            if not extracted_text:
-                continue
-
-            page_number = page_index + 1
-
-            documents.append(
-                Document(
-                    page_content=extracted_text,
-                    metadata={
-                        "source": uploaded_file.name,
-                        "file_name": uploaded_file.name,
-                        "page": page_number,
-                        "page_number": page_number,
-                    },
-                )
-            )
-
-    return documents
-
-
-def split_documents(documents: list[Document]) -> list[Document]:
-    """
-    Split page-level documents into overlapping chunks.
-
-    Required configuration:
-        chunk_size=1000
-        chunk_overlap=150
-    """
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=DEFAULT_CHUNK_SIZE,
-        chunk_overlap=DEFAULT_CHUNK_OVERLAP,
-        separators=[
-            "\n\n",
-            "\n",
-            ". ",
-            "; ",
-            ", ",
-            " ",
-            "",
-        ],
-    )
-
-    chunks = splitter.split_documents(documents)
-
-    for index, chunk in enumerate(chunks, start=1):
-        chunk.metadata["chunk_id"] = index
-
-    return chunks
-
-
-def build_vector_store(chunks: list[Document]) -> FAISS:
-    """
-    Create a FAISS vector index from document chunks.
-    """
-
-    embeddings = load_embedding_model()
-
-    return FAISS.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-    )
-
-
-def get_llm(api_key: str, model_name: str) -> ChatGroq:
-    """
-    Create a Groq chat model.
-
-    Temperature is kept at zero because compliance and contract analysis
-    should prioritize deterministic, evidence-based responses.
-    """
-
-    if not api_key:
-        raise ValueError(
-            "Groq API key is required. Add GROQ_API_KEY to Streamlit "
-            "Secrets, .env, or enter it in the sidebar."
+    if not raw_docs:
+        progress_bar.empty()
+        st.error(
+            "❌ No extractable text found in the uploaded PDF(s). "
+            "They may be scanned images without an OCR text layer."
         )
+        return
 
+    # Step 2: Chunk
+    progress_bar.progress(40, text="✂️ Splitting into overlapping chunks...")
+    chunks = chunk_documents(raw_docs)
+
+    # Step 3: Embed
+    progress_bar.progress(65, text="🧠 Loading embedding model (MiniLM-L6-v2)...")
+    embeddings = load_embedding_model(EMBEDDING_MODEL_NAME)
+    st.session_state.embeddings_model = embeddings
+
+    # Step 4: Index
+    progress_bar.progress(85, text="📚 Building FAISS vector index...")
+    vectorstore = build_vector_store(chunks, embeddings)
+
+    st.session_state.vectorstore = vectorstore
+    st.session_state.processed_files = [f.name for f in uploaded_files]
+    st.session_state.total_chunks = len(chunks)
+    st.session_state.processing_done = True
+
+    progress_bar.progress(100, text="✅ Indexing complete!")
+    time.sleep(0.4)
+    progress_bar.empty()
+    st.sidebar.success(
+        f"✅ Indexed {len(uploaded_files)} document(s) into {len(chunks)} chunks."
+    )
+
+
+# --------------------------------------------------------------------------
+# 4. RAG RETRIEVAL + LLM ANSWER + CORRECTIVE VERIFICATION
+# --------------------------------------------------------------------------
+
+def get_groq_llm(api_key: str, model_name: str, temperature: float = 0.1) -> ChatGroq:
+    """
+    Instantiates a ChatGroq LLM client with the given API key and model.
+    Low temperature is used deliberately since this is a compliance/audit
+    use case where determinism and faithfulness matter more than creativity.
+    """
     return ChatGroq(
-        api_key=api_key,
-        model=model_name,
-        temperature=0,
-        max_retries=2,
+        groq_api_key=api_key,
+        model_name=model_name,
+        temperature=temperature,
+        max_tokens=2048,
     )
 
 
-def format_retrieved_context(documents: list[Document]) -> str:
+def format_context(source_docs: List[Document]) -> str:
     """
-    Convert retrieved documents into a citation-aware context block.
-
-    Every chunk receives a stable evidence identifier.
+    Formats retrieved chunks into a single context string, each block
+    clearly tagged with its filename and page number so the LLM can cite
+    them accurately.
     """
-
-    context_parts: list[str] = []
-
-    for index, document in enumerate(documents, start=1):
-        file_name = document.metadata.get(
-            "file_name",
-            document.metadata.get("source", "Unknown"),
+    blocks = []
+    for i, doc in enumerate(source_docs, start=1):
+        src = doc.metadata.get("source", "unknown_file")
+        page = doc.metadata.get("page", "?")
+        blocks.append(
+            f"[Chunk {i} | Source: {src} | Page {page}]\n{doc.page_content}"
         )
-
-        page_number = document.metadata.get(
-            "page_number",
-            document.metadata.get("page", "Unknown"),
-        )
-
-        context_parts.append(
-            f"""
-[EVIDENCE {index}]
-File Name: {file_name}
-Page Number: {page_number}
-Citation: [{file_name} | Page {page_number}]
-
-Text:
-{document.page_content}
-[/EVIDENCE {index}]
-""".strip()
-        )
-
-    return "\n\n".join(context_parts)
+    return "\n\n---\n\n".join(blocks)
 
 
-def generate_draft_answer(
-    llm: ChatGroq,
-    user_query: str,
-    retrieved_documents: list[Document],
-) -> str:
+def retrieve_relevant_chunks(query: str, k: int = RETRIEVAL_K) -> List[Document]:
     """
-    First-generation RAG step.
-
-    The LLM is explicitly instructed to answer only from retrieved
-    evidence and provide file/page citations.
+    Runs a similarity search against the FAISS index for the given query.
     """
+    vectorstore: FAISS = st.session_state.vectorstore
+    return vectorstore.similarity_search(query, k=k)
 
-    context = format_retrieved_context(retrieved_documents)
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """
-You are a careful contract and compliance analysis assistant.
-
-Your job is to answer the user's question using ONLY the supplied
-document evidence.
-
-Rules:
-
-1. Do not use outside knowledge as factual evidence.
-2. Do not invent clauses, dates, obligations, parties, penalties,
-   percentages, deadlines, or legal conclusions.
-3. If the evidence does not contain enough information, explicitly say
-   that the supplied documents do not provide sufficient evidence.
-4. Every material factual statement must include a citation.
-5. Citations MUST use this format:
-
-   [File Name | Page N]
-
-6. When multiple documents support a statement, cite each relevant source.
-7. Distinguish between:
-   - What the document explicitly says.
-   - What can reasonably be inferred.
-   - What cannot be determined from the supplied documents.
-8. For compliance findings, identify the relevant requirement, evidence,
-   risk/issue, and recommendation when the evidence supports them.
-9. Never claim that a contract is legally valid, invalid, enforceable,
-   compliant, or non-compliant unless the supplied evidence explicitly
-   supports such a conclusion.
-10. Keep the answer professional and concise.
-
-Retrieved evidence:
-{context}
-""",
-            ),
-            (
-                "human",
-                "User question:\n{question}",
-            ),
-        ]
-    )
-
-    chain = prompt | llm
-
-    response = chain.invoke(
-        {
-            "context": context,
-            "question": user_query,
-        }
-    )
-
+def generate_draft_answer(llm: ChatGroq, query: str, context: str) -> str:
+    """
+    Stage 1 of Corrective RAG: generate an initial cited answer grounded
+    in the retrieved context.
+    """
+    prompt = SYSTEM_ANSWER_PROMPT.format(context=context, question=query)
+    response = llm.invoke(prompt)
     return response.content.strip()
 
 
-def verify_and_correct_answer(
-    llm: ChatGroq,
-    user_query: str,
-    draft_answer: str,
-    retrieved_documents: list[Document],
-) -> str:
+def run_groundedness_verification(
+    llm: ChatGroq, context: str, draft_answer: str
+) -> Dict[str, str]:
     """
-    Corrective verification stage.
-
-    The second LLM call acts as a groundedness checker/editor.
-
-    It checks:
-        - whether claims are supported
-        - whether citations exist
-        - whether citations point to retrieved evidence
-        - whether unsupported claims should be removed
-        - whether missing evidence should be explicitly disclosed
-
-    The verifier returns the corrected final answer rather than merely
-    returning a pass/fail score.
+    Stage 2 of Corrective RAG: the "Self-Verification / Groundedness Check".
+    Asks the LLM to critique its own draft answer against the source
+    context, and returns a structured dict with verdict, summary, issues,
+    and a corrected/final answer.
     """
+    prompt = VERIFICATION_PROMPT.format(context=context, draft_answer=draft_answer)
+    response = llm.invoke(prompt)
+    raw_text = response.content.strip()
 
-    context = format_retrieved_context(retrieved_documents)
+    parsed = {
+        "verdict": "UNVERIFIED",
+        "summary": "",
+        "issues": "",
+        "corrected_answer": draft_answer,
+        "raw": raw_text,
+    }
 
-    verification_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """
-You are the final groundedness and citation verifier for a
-document-analysis system.
+    try:
+        # Simple, robust section-based parsing of the structured verification output.
+        sections = {"VERDICT:": "verdict", "SUMMARY:": "summary",
+                    "ISSUES:": "issues", "CORRECTED_ANSWER:": "corrected_answer"}
 
-You will receive:
-1. The user's question.
-2. A draft answer.
-3. The exact evidence retrieved from the uploaded documents.
+        # Find start indices of each marker present in the raw text.
+        markers = []
+        for marker in sections:
+            idx = raw_text.find(marker)
+            if idx != -1:
+                markers.append((idx, marker))
+        markers.sort()
 
-Your task is to produce the FINAL corrected answer.
+        for i, (start_idx, marker) in enumerate(markers):
+            content_start = start_idx + len(marker)
+            content_end = markers[i + 1][0] if i + 1 < len(markers) else len(raw_text)
+            value = raw_text[content_start:content_end].strip()
+            key = sections[marker]
+            if key == "verdict":
+                # normalize to just the keyword
+                for candidate in ["FULLY_GROUNDED", "PARTIALLY_GROUNDED", "UNVERIFIED"]:
+                    if candidate in value:
+                        value = candidate
+                        break
+            parsed[key] = value
 
-Verification rules:
+        if not parsed["corrected_answer"]:
+            parsed["corrected_answer"] = draft_answer
 
-A. Compare every factual/material claim in the draft against the
-   retrieved evidence.
+    except Exception:
+        # If parsing fails for any reason, fall back gracefully to the raw
+        # verification text and the original draft answer.
+        parsed["summary"] = "Automatic parsing of verification output failed; showing raw output."
+        parsed["issues"] = raw_text
+        parsed["corrected_answer"] = draft_answer
 
-B. Remove or rewrite claims that cannot be directly supported.
-
-C. Never introduce information from your general knowledge.
-
-D. Every material factual statement must contain a citation in exactly
-   this form:
-
-   [File Name | Page N]
-
-E. A citation is valid only if that exact file and page occur in the
-   supplied evidence.
-
-F. If evidence is insufficient, clearly state:
-   "The supplied documents do not provide sufficient evidence to
-   determine this."
-
-G. Preserve useful supported findings.
-
-H. Do not fabricate citations.
-
-I. Do not claim legal enforceability or legal validity unless the
-   supplied evidence itself establishes that fact.
-
-J. Return ONLY the corrected final answer in Markdown.
-Do not discuss this verification process.
-
-Retrieved evidence:
-{context}
-
-Draft answer:
-{draft_answer}
-""",
-            ),
-            (
-                "human",
-                "Original user question:\n{question}",
-            ),
-        ]
-    )
-
-    chain = verification_prompt | llm
-
-    response = chain.invoke(
-        {
-            "context": context,
-            "draft_answer": draft_answer,
-            "question": user_query,
-        }
-    )
-
-    corrected_answer = response.content.strip()
-
-    if not corrected_answer:
-        return draft_answer
-
-    return corrected_answer
+    return parsed
 
 
-def retrieve_documents(
-    vector_store: FAISS,
-    query: str,
-    k: int = DEFAULT_RETRIEVAL_K,
-) -> list[Document]:
+def run_corrective_rag_pipeline(
+    query: str, api_key: str, model_name: str
+) -> Dict[str, Any]:
     """
-    Retrieve the most relevant document chunks from FAISS.
+    Orchestrates the full Corrective RAG flow for a single user query:
+        Retrieve -> LLM Draft Answer -> Groundedness Verification -> Final Output
     """
+    llm = get_groq_llm(api_key=api_key, model_name=model_name)
 
-    return vector_store.similarity_search(
-        query,
-        k=k,
-    )
+    source_docs = retrieve_relevant_chunks(query, k=RETRIEVAL_K)
+    context = format_context(source_docs)
+
+    draft_answer = generate_draft_answer(llm, query, context)
+    verification = run_groundedness_verification(llm, context, draft_answer)
+
+    return {
+        "query": query,
+        "draft_answer": draft_answer,
+        "final_answer": verification["corrected_answer"],
+        "verdict": verification["verdict"],
+        "verification_summary": verification["summary"],
+        "verification_issues": verification["issues"],
+        "source_docs": source_docs,
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+    }
 
 
-def render_source_evidence(documents: list[Document]) -> None:
-    """
-    Render retrieved evidence in an expandable UI section.
-    """
+# --------------------------------------------------------------------------
+# 5. UI RENDERING HELPERS
+# --------------------------------------------------------------------------
 
-    with st.expander(
-        f"🔎 Retrieved Source Evidence ({len(documents)} chunks)",
-        expanded=False,
-    ):
-        st.caption(
-            "These are the exact text chunks supplied to the LLM during "
-            "answer generation and verification."
-        )
+def verdict_badge_html(verdict: str) -> str:
+    verdict = (verdict or "").upper()
+    if "FULLY" in verdict:
+        return '<span class="badge-grounded">✅ FULLY GROUNDED</span>'
+    elif "PARTIALLY" in verdict:
+        return '<span class="badge-warning">⚠️ PARTIALLY GROUNDED</span>'
+    else:
+        return '<span class="badge-unverified">🚫 UNVERIFIED</span>'
 
-        for index, document in enumerate(documents, start=1):
-            file_name = document.metadata.get(
-                "file_name",
-                document.metadata.get("source", "Unknown"),
-            )
 
-            page_number = document.metadata.get(
-                "page_number",
-                document.metadata.get("page", "Unknown"),
-            )
-
-            chunk_id = document.metadata.get(
-                "chunk_id",
-                index,
-            )
-
+def render_sources_expander(source_docs: List[Document]) -> None:
+    with st.expander("📎 View Retrieved Source Chunks & Citations", expanded=False):
+        if not source_docs:
+            st.info("No source chunks were retrieved for this query.")
+            return
+        for i, doc in enumerate(source_docs, start=1):
+            src = doc.metadata.get("source", "unknown_file")
+            page = doc.metadata.get("page", "?")
             st.markdown(
-                f"""
-                <div class="source-card">
-                    <strong>Evidence {index}</strong><br>
-                    <span class="citation">
-                        📄 {file_name} | Page {page_number}
-                    </span><br>
-                    Chunk ID: {chunk_id}
-                </div>
-                """,
+                f'<div class="source-meta">Chunk {i} &nbsp;·&nbsp; '
+                f'📄 {src} &nbsp;·&nbsp; Page {page}</div>'
+                f'<div class="source-chunk">{doc.page_content}</div>',
                 unsafe_allow_html=True,
             )
 
-            st.code(
-                document.page_content,
-                language="text",
-            )
+
+def render_verification_expander(result: Dict[str, Any]) -> None:
+    with st.expander("🔍 View Corrective Verification Details", expanded=False):
+        st.markdown(f"**Verdict:** {verdict_badge_html(result['verdict'])}", unsafe_allow_html=True)
+        if result.get("verification_summary"):
+            st.markdown(f"**Assessment Summary:** {result['verification_summary']}")
+        if result.get("verification_issues"):
+            st.markdown("**Flagged Issues:**")
+            st.markdown(result["verification_issues"])
+        st.markdown("---")
+        st.markdown("**Original Draft Answer (pre-verification):**")
+        st.markdown(result["draft_answer"])
 
 
-def render_document_stats() -> None:
-    """
-    Render processing statistics.
-    """
-
-    stats = st.session_state.document_stats
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div class="metric-value">{stats["files"]}</div>
-                <div class="metric-label">PDF Files</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with col2:
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div class="metric-value">{stats["pages"]}</div>
-                <div class="metric-label">Pages Extracted</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with col3:
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div class="metric-value">{stats["chunks"]}</div>
-                <div class="metric-label">Indexed Chunks</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 6. SIDEBAR — CONTROLS
+# --------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("⚙️ Auditor Configuration")
+    st.markdown("## ⚙️ Configuration")
 
-    st.markdown(
-        """
-        Upload one or more PDF documents. The application creates a
-        temporary FAISS index in the current Streamlit session.
-        """
-    )
+    # ---- API Key resolution: secrets.toml -> env var -> manual input ----
+    default_api_key = ""
+    try:
+        default_api_key = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        default_api_key = os.environ.get("GROQ_API_KEY", "")
 
-    uploaded_files = st.file_uploader(
-        "📄 Upload PDF Documents",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="Upload contracts, policies, agreements, compliance documents, or related PDFs.",
-    )
-
-    st.divider()
-
-    configured_api_key = get_secret_or_env("GROQ_API_KEY")
-
-    api_key = st.text_input(
-        "🔑 Groq API Key",
+    api_key_input = st.text_input(
+        "Groq API Key",
         value="",
         type="password",
-        placeholder=(
-            "Using configured secret"
-            if configured_api_key
-            else "Enter your Groq API key"
-        ),
+        placeholder="gsk_...",
         help=(
-            "The key can come from Streamlit Secrets, .env, or this field."
+            "If left blank, the app will fall back to GROQ_API_KEY from "
+            "Streamlit secrets or your local .env file."
         ),
     )
+    resolved_api_key = api_key_input.strip() or default_api_key
 
-    effective_api_key = api_key.strip() or configured_api_key
-
-    model_name = st.selectbox(
-        "🤖 Groq Model",
-        options=SUPPORTED_MODELS,
-        index=0,
-        help="Select the Groq model used for generation and verification.",
-    )
-
-    st.divider()
-
-    process_documents = st.button(
-        "🚀 Process Documents",
-        type="primary",
-        use_container_width=True,
-    )
-
-    if st.session_state.vector_store is not None:
-        st.success("Vector index ready")
-
-    st.caption(
-        "Embeddings: all-MiniLM-L6-v2\n\n"
-        "Vector DB: FAISS CPU\n\n"
-        "Retrieval: Top 4 chunks\n\n"
-        "Chunk size: 1000\n\n"
-        "Chunk overlap: 150"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Document processing
-# ---------------------------------------------------------------------------
-
-if process_documents:
-    if not uploaded_files:
-        st.warning("Please upload at least one PDF document.")
+    if resolved_api_key:
+        st.success("🔑 API key loaded.")
     else:
-        with st.status(
-            "Processing documents...",
-            expanded=True,
-        ) as status:
-            try:
-                st.write("📖 Extracting PDF text...")
+        st.warning("🔑 No Groq API key found. Enter one above to proceed.")
 
-                page_documents = extract_pdf_documents(
-                    uploaded_files
-                )
+    st.markdown("---")
 
-                if not page_documents:
-                    raise ValueError(
-                        "No extractable text was found in the uploaded PDFs. "
-                        "The files may contain scanned images instead of "
-                        "machine-readable text."
-                    )
+    selected_model = st.selectbox(
+        "LLM Model (Groq)",
+        options=AVAILABLE_MODELS,
+        index=0,
+        help="llama-3.3-70b-versatile is more accurate; llama3-8b-8192 is faster/cheaper.",
+    )
 
-                st.write(
-                    f"✅ Extracted text from {len(page_documents)} pages."
-                )
+    st.markdown("---")
+    st.markdown("## 📤 Upload Documents")
+    uploaded_files = st.file_uploader(
+        "Upload one or more PDF contracts / policy documents",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Text-based PDFs work best. Scanned images without OCR text will not extract.",
+    )
 
-                st.write("✂️ Splitting documents into overlapping chunks...")
+    process_clicked = st.button("🚀 Process Documents", use_container_width=True, type="primary")
 
-                chunks = split_documents(page_documents)
+    if process_clicked:
+        if not resolved_api_key:
+            st.error("❌ Please provide a Groq API key before processing.")
+        else:
+            process_uploaded_documents(uploaded_files)
 
-                if not chunks:
-                    raise ValueError(
-                        "Document splitting produced no usable chunks."
-                    )
-
-                st.write(
-                    f"✅ Created {len(chunks)} chunks."
-                )
-
-                st.write(
-                    "🧠 Loading HuggingFace embedding model..."
-                )
-
-                # Explicitly initialize here so failures happen during
-                # processing rather than during a later query.
-                load_embedding_model()
-
-                st.write("🔎 Building FAISS vector index...")
-
-                vector_store = build_vector_store(chunks)
-
-                # Store everything required by the current session.
-                st.session_state.vector_store = vector_store
-                st.session_state.processed_documents = [
-                    file.name for file in uploaded_files
-                ]
-                st.session_state.document_chunks = chunks
-                st.session_state.document_stats = {
-                    "files": len(uploaded_files),
-                    "pages": len(page_documents),
-                    "chunks": len(chunks),
-                }
-
-                st.session_state.last_query = ""
-                st.session_state.last_sources = []
-
-                status.update(
-                    label="Documents processed successfully!",
-                    state="complete",
-                    expanded=False,
-                )
-
-            except Exception as exc:
-                status.update(
-                    label="Document processing failed",
-                    state="error",
-                    expanded=True,
-                )
-
-                st.error(
-                    f"Processing error: {exc}"
-                )
-
-
-# ---------------------------------------------------------------------------
-# Main document status
-# ---------------------------------------------------------------------------
-
-if st.session_state.vector_store is not None:
-    st.subheader("📊 Indexed Document Collection")
-
-    if st.session_state.processed_documents:
-        st.write(
-            " **Processed files:** "
-            + ", ".join(st.session_state.processed_documents)
-        )
-
-    render_document_stats()
-
-    st.divider()
-
-
-# ---------------------------------------------------------------------------
-# Query interface
-# ---------------------------------------------------------------------------
-
-st.subheader("🔍 Ask Your Compliance or Contract Question")
-
-st.markdown(
-    """
-    Ask questions such as:
-
-    - What termination obligations are defined in the agreement?
-    - Which party is responsible for data protection?
-    - Identify clauses that may create compliance risks.
-    - What are the payment deadlines?
-    - Compare the confidentiality requirements across the uploaded contracts.
-    - Does the policy mention an incident notification deadline?
-    """
-)
-
-query = st.text_area(
-    "Your question",
-    placeholder=(
-        "Example: Identify the termination obligations in the uploaded "
-        "contracts and cite the relevant file and page."
-    ),
-    height=120,
-)
-
-analyze_button = st.button(
-    "🔎 Analyze Documents",
-    type="primary",
-    use_container_width=True,
-)
-
-
-# ---------------------------------------------------------------------------
-# RAG + Corrective Verification
-# ---------------------------------------------------------------------------
-
-if analyze_button:
-    if not query.strip():
-        st.warning("Please enter a question.")
-        st.stop()
-
-    if st.session_state.vector_store is None:
-        st.warning(
-            "Please upload and process documents before asking a question."
-        )
-        st.stop()
-
-    if not effective_api_key:
-        st.error(
-            "Groq API key not found. Add GROQ_API_KEY to Streamlit Secrets "
-            "or .env, or enter the key in the sidebar."
-        )
-        st.stop()
-
-    try:
-        with st.status(
-            "Running corrective RAG analysis...",
-            expanded=True,
-        ) as status:
-
-            # ---------------------------------------------------------------
-            # Stage 1: Retrieval
-            # ---------------------------------------------------------------
-
-            st.write(
-                "🔎 Stage 1/3 — Retrieving the most relevant evidence..."
-            )
-
-            retrieved_documents = retrieve_documents(
-                st.session_state.vector_store,
-                query.strip(),
-                k=DEFAULT_RETRIEVAL_K,
-            )
-
-            if not retrieved_documents:
-                status.update(
-                    label="No relevant evidence found",
-                    state="complete",
-                    expanded=False,
-                )
-
-                st.warning(
-                    "No relevant document chunks were retrieved for this query."
-                )
-
-                st.stop()
-
-            # ---------------------------------------------------------------
-            # Stage 2: Draft generation
-            # ---------------------------------------------------------------
-
-            st.write(
-                "🤖 Stage 2/3 — Generating an evidence-grounded draft..."
-            )
-
-            llm = get_llm(
-                api_key=effective_api_key,
-                model_name=model_name,
-            )
-
-            draft_answer = generate_draft_answer(
-                llm=llm,
-                user_query=query.strip(),
-                retrieved_documents=retrieved_documents,
-            )
-
-            # ---------------------------------------------------------------
-            # Stage 3: Corrective verification
-            # ---------------------------------------------------------------
-
-            st.write(
-                "🛡️ Stage 3/3 — Verifying claims and correcting citations..."
-            )
-
-            final_answer = verify_and_correct_answer(
-                llm=llm,
-                user_query=query.strip(),
-                draft_answer=draft_answer,
-                retrieved_documents=retrieved_documents,
-            )
-
-            st.session_state.last_query = query.strip()
-            st.session_state.last_sources = retrieved_documents
-
-            status.update(
-                label="Analysis and verification completed",
-                state="complete",
-                expanded=False,
-            )
-
-        # ---------------------------------------------------------------
-        # Final output
-        # ---------------------------------------------------------------
-
-        st.subheader("🧠 Verified Analysis")
-
-        st.markdown(final_answer)
-
+    if st.session_state.processing_done:
+        st.markdown("---")
+        st.markdown("## 📊 Index Status")
         st.markdown(
-            """
-            <div class="success-box">
-                <strong>Groundedness verification completed.</strong><br>
-                The final response was checked against the retrieved
-                document evidence before being displayed.
-            </div>
-            """,
+            f'<div class="metric-card">'
+            f'<b>Files indexed:</b> {len(st.session_state.processed_files)}<br>'
+            f'<b>Total chunks:</b> {st.session_state.total_chunks}<br>'
+            f'<b>Embedding model:</b> MiniLM-L6-v2'
+            f'</div>',
             unsafe_allow_html=True,
         )
+        for fname in st.session_state.processed_files:
+            st.caption(f"✔️ {fname}")
 
-        st.divider()
-
-        render_source_evidence(retrieved_documents)
-
-    except Exception as exc:
-        st.error(
-            f"Unable to complete the analysis: {exc}"
-        )
-
-        with st.expander("Technical details"):
-            st.exception(exc)
+        if st.button("🗑️ Clear Index & Chat", use_container_width=True):
+            st.session_state.vectorstore = None
+            st.session_state.processed_files = []
+            st.session_state.chat_history = []
+            st.session_state.processing_done = False
+            st.session_state.total_chunks = 0
+            st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# Initial state information
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 7. MAIN PAGE — HEADER
+# --------------------------------------------------------------------------
 
-if st.session_state.vector_store is None:
+st.markdown(
+    '<div class="app-title">📑 Smart Multi-Document Compliance & Contract Auditor</div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<div class="app-subtitle">Multi-Stage Corrective RAG — Upload contracts, ask compliance '
+    'questions, and get answers with verified citations and a self-grounded audit trail.</div>',
+    unsafe_allow_html=True,
+)
+
+if not st.session_state.processing_done:
     st.info(
-        "👈 Upload one or more PDF documents in the sidebar and click "
-        "**Process Documents** to build the searchable knowledge base."
+        "👈 Start by uploading one or more PDF contracts in the sidebar, then click "
+        "**Process Documents** to build the searchable index."
     )
 
 
-# ---------------------------------------------------------------------------
-# Footer
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 8. MAIN PAGE — CHAT HISTORY RENDER
+# --------------------------------------------------------------------------
 
-st.divider()
+for turn in st.session_state.chat_history:
+    with st.chat_message("user"):
+        st.markdown(turn["query"])
+    with st.chat_message("assistant"):
+        st.markdown(verdict_badge_html(turn["verdict"]), unsafe_allow_html=True)
+        st.markdown(turn["final_answer"])
+        render_sources_expander(turn["source_docs"])
+        render_verification_expander(turn)
 
-st.caption(
-    "Smart Multi-Document Compliance & Contract Auditor • "
-    "Streamlit + LangChain + Groq + HuggingFace + FAISS"
+
+# --------------------------------------------------------------------------
+# 9. MAIN PAGE — CHAT INPUT
+# --------------------------------------------------------------------------
+
+user_query = st.chat_input(
+    "Ask a compliance question, e.g. 'What are the termination clauses and their notice periods?'"
 )
 
+if user_query:
+    if not st.session_state.processing_done or st.session_state.vectorstore is None:
+        st.error("❌ Please upload and process at least one document first.")
+    elif not resolved_api_key:
+        st.error("❌ Please provide a valid Groq API key in the sidebar.")
+    else:
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        with st.chat_message("assistant"):
+            with st.spinner("🔎 Retrieving relevant clauses..."):
+                try:
+                    result = run_corrective_rag_pipeline(
+                        query=user_query,
+                        api_key=resolved_api_key,
+                        model_name=selected_model,
+                    )
+                except Exception as exc:
+                    st.error(f"❌ An error occurred while processing your query: {exc}")
+                    result = None
+
+            if result:
+                st.markdown(verdict_badge_html(result["verdict"]), unsafe_allow_html=True)
+                st.markdown(result["final_answer"])
+                render_sources_expander(result["source_docs"])
+                render_verification_expander(result)
+
+                st.session_state.chat_history.append(result)
+
+
+# --------------------------------------------------------------------------
+# 10. FOOTER
+# --------------------------------------------------------------------------
+
+st.markdown("---")
 st.caption(
-    "⚠️ This tool provides document-grounded analysis and should not be "
-    "treated as legal advice."
+    "Smart Multi-Document Compliance & Contract Auditor · Built with Streamlit, "
+    "LangChain, Groq (Llama 3.3), HuggingFace MiniLM embeddings, and FAISS. "
+    "Always have a qualified human reviewer verify compliance-critical outputs."
 )
